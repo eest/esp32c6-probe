@@ -472,6 +472,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-backtrace"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c304bbe17df32db8bc0027a9da989aa3efebbd4e7a79d58850deb29e2af577f"
+dependencies = [
+ "cfg-if",
+ "esp-build",
+ "esp-config",
+ "esp-metadata",
+ "esp-println",
+ "heapless",
+]
+
+[[package]]
 name = "esp-bootloader-esp-idf"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -605,6 +619,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-println"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fae8b38d5fdc1d29d823c4737f18edfb0ccf0406985cf893f87c0cfc26a6ab33"
+dependencies = [
+ "critical-section",
+ "document-features",
+ "esp-build",
+ "esp-metadata",
+ "log",
+ "portable-atomic",
+]
+
+[[package]]
 name = "esp-riscv-rt"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -673,9 +701,11 @@ dependencies = [
  "embedded-io",
  "embedded-io-async",
  "esp-alloc",
+ "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-hal-embassy",
+ "esp-println",
  "esp-wifi",
  "smoltcp",
  "static_cell",

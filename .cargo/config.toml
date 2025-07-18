@@ -2,6 +2,8 @@
 runner = "espflash flash --monitor --chip esp32c6"
 
 [env]
+SSID = "SSID"
+PASSWORD = "PASSWORD"
 
 [build]
 rustflags = [
