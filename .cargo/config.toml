@@ -2,8 +2,11 @@
 runner = "espflash flash --monitor --chip esp32c6"
 
 [env]
-SSID = "SSID"
-PASSWORD = "PASSWORD"
+WIFI_SSID = "wifi_ssid"
+WIFI_PASSWORD = "wifi_password"
+MQTT_SERVER_IPV4 = "192.0.2.0"
+MQTT_USERNAME = "mqtt_username"
+MQTT_PASSWORD = "mqtt_password"
 
 [build]
 rustflags = [

@@ -7,6 +7,7 @@
 )]
 
 use core::net::Ipv4Addr;
+use core::str::FromStr;
 
 use embassy_executor::Spawner;
 use embassy_net::{tcp::TcpSocket, Runner, StackResources};
@@ -14,22 +15,41 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal::{clock::CpuClock, rng::Rng};
+use esp_hal::timer::OneShotTimer;
+use esp_hal::{clock::CpuClock, i2c::master, rng::Rng, time::Rate};
 use esp_println::println;
 use esp_wifi::{
     init,
     wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
     EspWifiController,
 };
+use heapless::String;
+use rust_mqtt::{
+    client::{client::MqttClient, client_config::ClientConfig},
+    packet::v5::reason_codes::ReasonCode,
+    utils::rng_generator::CountingRng,
+};
+use serde::Serialize;
 
 extern crate alloc;
+
+use hdc302x::{Hdc302x, I2cAddr, LowPowerMode, ManufacturerId};
+
+#[derive(Serialize)]
+struct ProbeData {
+    centigrade: f32,
+    humidity_percent: f32,
+}
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const SSID: &str = env!("SSID");
-const PASSWORD: &str = env!("PASSWORD");
+const WIFI_SSID: &str = env!("WIFI_SSID");
+const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+const MQTT_SERVER_IPV4: &str = env!("MQTT_SERVER_IPV4");
+const MQTT_USERNAME: &str = env!("MQTT_USERNAME");
+const MQTT_PASSWORD: &str = env!("MQTT_PASSWORD");
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
 macro_rules! mk_static {
@@ -64,6 +84,56 @@ async fn main(spawner: Spawner) {
 
     let systimer = SystemTimer::new(peripherals.SYSTIMER);
     esp_hal_embassy::init(systimer.alarm0);
+
+    let i2c = master::I2c::new(
+        peripherals.I2C0,
+        master::Config::default().with_frequency(Rate::from_khz(400)),
+    )
+    .unwrap()
+    .with_sda(peripherals.GPIO6)
+    .with_scl(peripherals.GPIO7)
+    .into_async();
+
+    let delay = OneShotTimer::new(systimer.alarm1).into_async();
+
+    let mut hdc302x = Hdc302x::new(i2c, delay, I2cAddr::Addr00);
+
+    match hdc302x.read_manufacturer_id_async().await {
+        Ok(ManufacturerId::TexasInstruments) => {
+            println!(
+                "hdc302x: manufacturer id: {}",
+                ManufacturerId::TexasInstruments
+            );
+        }
+        Ok(manuf_id) => {
+            println!("hdc302x: unexpected manufacturer id: {manuf_id}");
+            return;
+        }
+        Err(e) => {
+            println!("hdc302x: read_manufacturer_id error: {e:?}");
+            return;
+        }
+    }
+
+    match hdc302x.read_serial_number_async().await {
+        Ok(serial_number) => {
+            println!("hdc302x: serial_number: {serial_number}");
+        }
+        Err(e) => {
+            println!("hdc302x: read_serial_number error: {e:?}");
+            return;
+        }
+    }
+
+    match hdc302x.read_status_async(true).await {
+        Ok(status_bits) => {
+            println!("hdc302x: status_bits: {status_bits}");
+        }
+        Err(e) => {
+            println!("hdc302x: read_status error: {e:?}");
+            return;
+        }
+    }
 
     let config = embassy_net::Config::dhcpv4(Default::default());
 
@@ -102,42 +172,114 @@ async fn main(spawner: Spawner) {
     loop {
         Timer::after(Duration::from_millis(1_000)).await;
 
+        let server_ipv4 = Ipv4Addr::from_str(MQTT_SERVER_IPV4).unwrap();
+
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
 
         socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
-        let remote_endpoint = (Ipv4Addr::new(192, 168, 10, 1), 8089);
-        println!("connecting...");
+        let remote_endpoint = (server_ipv4, 1883);
+        println!("connecting to {}...", server_ipv4);
         let r = socket.connect(remote_endpoint).await;
         if let Err(e) = r {
             println!("connect error: {:?}", e);
             continue;
         }
         println!("connected!");
-        let mut buf = [0; 1024];
-        loop {
-            use embedded_io_async::Write;
-            let r = socket
-                .write_all(b"GET / HTTP/1.0\r\nHost: sigterm.se\r\n\r\n")
-                .await;
-            if let Err(e) = r {
-                println!("write error: {:?}", e);
-                break;
-            }
-            let n = match socket.read(&mut buf).await {
-                Ok(0) => {
-                    println!("read EOF");
-                    break;
+
+        let mut mqtt_config = ClientConfig::new(
+            rust_mqtt::client::client_config::MqttVersion::MQTTv5,
+            CountingRng(20000),
+        );
+
+        mqtt_config
+            .add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
+        mqtt_config.add_client_id("clientId-rs-testing");
+        mqtt_config.add_username(MQTT_USERNAME);
+        mqtt_config.add_password(MQTT_PASSWORD);
+        mqtt_config.max_packet_size = 100;
+
+        let mut recv_buffer = [0; 80];
+        let mut write_buffer = [0; 80];
+
+        let mut mqtt_client = MqttClient::<_, 5, _>::new(
+            socket,
+            &mut write_buffer,
+            80,
+            &mut recv_buffer,
+            80,
+            mqtt_config,
+        );
+
+        match mqtt_client.connect_to_broker().await {
+            Ok(()) => {}
+            Err(mqtt_error) => match mqtt_error {
+                ReasonCode::NetworkError => {
+                    println!("MQTT Network Error");
+                    continue;
                 }
-                Ok(n) => n,
-                Err(e) => {
-                    println!("read error: {:?}", e);
-                    break;
+                _ => {
+                    println!("Other MQTT Error: {:?}", mqtt_error);
+                    continue;
                 }
-            };
-            println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
+            },
         }
-        Timer::after(Duration::from_millis(3000)).await;
+
+        loop {
+            Timer::after(Duration::from_millis(1_000)).await;
+
+            match hdc302x.read_status_async(true).await {
+                Ok(status_bits) => {
+                    println!("hdc302x: status_bits: {status_bits}");
+                }
+                Err(e) => {
+                    println!("hdc302x: read_status error: {e:?}");
+                    return;
+                }
+            }
+
+            let raw_datum = hdc302x
+                .one_shot_async(LowPowerMode::lowest_noise())
+                .await
+                .unwrap();
+
+            let d = hdc302x::Datum::from(&raw_datum);
+            println!("{:?}", d);
+
+            let centigrade = raw_datum.centigrade().unwrap();
+            let humidity_percent = raw_datum.humidity_percent().unwrap();
+
+            let pdata = ProbeData {
+                centigrade,
+                humidity_percent,
+            };
+
+            let serialized: String<128> = serde_json_core::to_string(&pdata).unwrap();
+
+            match mqtt_client
+                .send_message(
+                    "temperature/1",
+                    serialized.as_bytes(),
+                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
+                    true,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(mqtt_error) => match mqtt_error {
+                    ReasonCode::NetworkError => {
+                        println!("MQTT Network Error");
+                        continue;
+                    }
+                    _ => {
+                        println!("Other MQTT Error: {:?}", mqtt_error);
+                        continue;
+                    }
+                },
+            }
+
+            Timer::after(Duration::from_millis(3000)).await;
+        }
     }
 }
 
@@ -156,8 +298,8 @@ async fn connection(mut controller: WifiController<'static>) {
         }
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config = Configuration::Client(ClientConfiguration {
-                ssid: SSID.into(),
-                password: PASSWORD.into(),
+                ssid: WIFI_SSID.into(),
+                password: WIFI_PASSWORD.into(),
                 ..Default::default()
             });
             controller.set_configuration(&client_config).unwrap();
