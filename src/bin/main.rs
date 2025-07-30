@@ -261,7 +261,7 @@ async fn main(spawner: Spawner) {
                     "temperature/1",
                     serialized.as_bytes(),
                     rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
-                    true,
+                    false,
                 )
                 .await
             {
