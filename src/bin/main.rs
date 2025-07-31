@@ -18,6 +18,7 @@ use esp_hal::timer::timg::TimerGroup;
 use esp_hal::timer::OneShotTimer;
 use esp_hal::{clock::CpuClock, i2c::master, rng::Rng, time::Rate};
 use esp_println::println;
+use esp_println::logger::init_logger_from_env;
 use esp_wifi::{
     init,
     wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
@@ -64,6 +65,7 @@ macro_rules! mk_static {
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
     // generator version: 0.4.0
+    init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
