@@ -1653,7 +1653,3 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[patch.unused]]
-name = "hdc302x-async"
-version = "0.3.0"

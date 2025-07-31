@@ -68,6 +68,3 @@ incremental      = false
 lto              = 'fat'
 opt-level        = 's'
 overflow-checks  = false
-
-[patch.crates-io]
-hdc302x-async = { path = "/Users/patrik/git/hdc302x-rs" }
