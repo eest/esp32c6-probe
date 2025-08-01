@@ -17,7 +17,6 @@ use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::timer::OneShotTimer;
 use esp_hal::{clock::CpuClock, i2c::master, rng::Rng, time::Rate};
-use esp_println::println;
 use esp_println::logger::init_logger_from_env;
 use esp_wifi::{
     init,
@@ -25,6 +24,7 @@ use esp_wifi::{
     EspWifiController,
 };
 use heapless::String;
+use log::info;
 use rust_mqtt::{
     client::{client::MqttClient, client_config::ClientConfig},
     packet::v5::reason_codes::ReasonCode,
@@ -102,37 +102,37 @@ async fn main(spawner: Spawner) {
 
     match hdc302x.read_manufacturer_id_async().await {
         Ok(ManufacturerId::TexasInstruments) => {
-            println!(
+            info!(
                 "hdc302x: manufacturer id: {}",
                 ManufacturerId::TexasInstruments
             );
         }
         Ok(manuf_id) => {
-            println!("hdc302x: unexpected manufacturer id: {manuf_id}");
+            info!("hdc302x: unexpected manufacturer id: {manuf_id}");
             return;
         }
         Err(e) => {
-            println!("hdc302x: read_manufacturer_id error: {e:?}");
+            info!("hdc302x: read_manufacturer_id error: {e:?}");
             return;
         }
     }
 
     match hdc302x.read_serial_number_async().await {
         Ok(serial_number) => {
-            println!("hdc302x: serial_number: {serial_number}");
+            info!("hdc302x: serial_number: {serial_number}");
         }
         Err(e) => {
-            println!("hdc302x: read_serial_number error: {e:?}");
+            info!("hdc302x: read_serial_number error: {e:?}");
             return;
         }
     }
 
     match hdc302x.read_status_async(true).await {
         Ok(status_bits) => {
-            println!("hdc302x: status_bits: {status_bits}");
+            info!("hdc302x: status_bits: {status_bits}");
         }
         Err(e) => {
-            println!("hdc302x: read_status error: {e:?}");
+            info!("hdc302x: read_status error: {e:?}");
             return;
         }
     }
@@ -162,10 +162,10 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(500)).await;
     }
 
-    println!("Waiting to get IP address...");
+    info!("Waiting to get IP address...");
     loop {
         if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
+            info!("Got IP: {}", config.address);
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
@@ -181,13 +181,13 @@ async fn main(spawner: Spawner) {
         socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
         let remote_endpoint = (server_ipv4, 1883);
-        println!("connecting to {}...", server_ipv4);
+        info!("connecting to {}...", server_ipv4);
         let r = socket.connect(remote_endpoint).await;
         if let Err(e) = r {
-            println!("connect error: {:?}", e);
+            info!("connect error: {:?}", e);
             continue;
         }
-        println!("connected!");
+        info!("connected!");
 
         let mut mqtt_config = ClientConfig::new(
             rust_mqtt::client::client_config::MqttVersion::MQTTv5,
@@ -217,11 +217,11 @@ async fn main(spawner: Spawner) {
             Ok(()) => {}
             Err(mqtt_error) => match mqtt_error {
                 ReasonCode::NetworkError => {
-                    println!("MQTT Network Error");
+                    info!("MQTT Network Error");
                     continue;
                 }
                 _ => {
-                    println!("Other MQTT Error: {:?}", mqtt_error);
+                    info!("Other MQTT Error: {:?}", mqtt_error);
                     continue;
                 }
             },
@@ -232,10 +232,10 @@ async fn main(spawner: Spawner) {
 
             match hdc302x.read_status_async(true).await {
                 Ok(status_bits) => {
-                    println!("hdc302x: status_bits: {status_bits}");
+                    info!("hdc302x: status_bits: {status_bits}");
                 }
                 Err(e) => {
-                    println!("hdc302x: read_status error: {e:?}");
+                    info!("hdc302x: read_status error: {e:?}");
                     return;
                 }
             }
@@ -246,7 +246,7 @@ async fn main(spawner: Spawner) {
                 .unwrap();
 
             let d = hdc302x::Datum::from(&raw_datum);
-            println!("{:?}", d);
+            info!("{:?}", d);
 
             let centigrade = raw_datum.centigrade().unwrap();
             let humidity_percent = raw_datum.humidity_percent().unwrap();
@@ -270,11 +270,11 @@ async fn main(spawner: Spawner) {
                 Ok(()) => {}
                 Err(mqtt_error) => match mqtt_error {
                     ReasonCode::NetworkError => {
-                        println!("MQTT Network Error");
+                        info!("MQTT Network Error");
                         continue;
                     }
                     _ => {
-                        println!("Other MQTT Error: {:?}", mqtt_error);
+                        info!("Other MQTT Error: {:?}", mqtt_error);
                         continue;
                     }
                 },
@@ -287,8 +287,8 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
-    println!("start connection task");
-    println!("Device capabilities: {:?}", controller.capabilities());
+    info!("start connection task");
+    info!("Device capabilities: {:?}", controller.capabilities());
     loop {
         match esp_wifi::wifi::wifi_state() {
             WifiState::StaConnected => {
@@ -305,22 +305,22 @@ async fn connection(mut controller: WifiController<'static>) {
                 ..Default::default()
             });
             controller.set_configuration(&client_config).unwrap();
-            println!("Starting wifi");
+            info!("Starting wifi");
             controller.start_async().await.unwrap();
-            println!("Wifi started!");
+            info!("Wifi started!");
 
-            println!("Scan");
+            info!("Scan");
             let result = controller.scan_n_async(10).await.unwrap();
             for ap in result {
-                println!("{:?}", ap);
+                info!("{:?}", ap);
             }
         }
-        println!("About to connect...");
+        info!("About to connect...");
 
         match controller.connect_async().await {
-            Ok(_) => println!("Wifi connected!"),
+            Ok(_) => info!("Wifi connected!"),
             Err(e) => {
-                println!("Failed to connect to wifi: {e:?}");
+                info!("Failed to connect to wifi: {e:?}");
                 Timer::after(Duration::from_millis(5000)).await
             }
         }

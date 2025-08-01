@@ -724,6 +724,7 @@ dependencies = [
  "esp-wifi",
  "hdc302x",
  "heapless",
+ "log",
  "rust-mqtt",
  "serde",
  "serde-json-core",
