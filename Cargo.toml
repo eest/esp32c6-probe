@@ -35,7 +35,8 @@ esp-wifi = { version = "0.14.1", features = [
   "wifi",
 ] }
 # Use my own fork where humidity can be fetched
-hdc302x = { git = "https://github.com/eest/hdc302x-rs", rev = "9153700ff8d9cc6fe0c115314e2547a4f720c915", features = ["log"] }
+#hdc302x = { version = "0.3.0", features = ["log"] }
+hdc302x = { git = "https://github.com/eest/hdc302x-rs", rev = "f194d713b16f0d7f887c1b1fdf0de630c4eb2275", features = ["log"] }
 smoltcp = { version = "0.12.0", default-features = false, features = [
   "medium-ethernet",
   "multicast",
