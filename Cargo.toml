@@ -55,6 +55,7 @@ serde-json-core = "0.6.0"
 heapless = "0.8.0"
 rust-mqtt = { version = "0.3.0", default-features = false }
 log = "0.4.27"
+embassy-sync = "0.7.2"
 
 
 [profile.dev]

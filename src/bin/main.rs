@@ -10,7 +10,11 @@ use core::net::Ipv4Addr;
 use core::str::FromStr;
 
 use embassy_executor::Spawner;
+use embassy_net::Stack;
 use embassy_net::{tcp::TcpSocket, Runner, StackResources};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::channel::Receiver;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::timer::systimer::SystemTimer;
@@ -31,6 +35,7 @@ use rust_mqtt::{
     utils::rng_generator::CountingRng,
 };
 use serde::Serialize;
+use static_cell::StaticCell;
 
 extern crate alloc;
 
@@ -61,6 +66,8 @@ macro_rules! mk_static {
         x
     }};
 }
+
+static CHANNEL: StaticCell<Channel<NoopRawMutex, String<128>, 3>> = StaticCell::new();
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
@@ -152,9 +159,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(connection(controller)).ok();
     spawner.spawn(net_task(runner)).ok();
 
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
-
     loop {
         if stack.is_link_up() {
             break;
@@ -171,8 +175,109 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(500)).await;
     }
 
+    //let temp_channel = mk_static!(Channel::<NoopRawMutex, String<128>, 3>::new();
+    let temp_channel = CHANNEL.init(Channel::new());
+    spawner
+        .spawn(mqtt_task(stack, temp_channel.receiver()))
+        .ok();
+    let temp_sender = temp_channel.sender();
+
     loop {
         Timer::after(Duration::from_millis(1_000)).await;
+
+        loop {
+            Timer::after(Duration::from_millis(1_000)).await;
+
+            match hdc302x.read_status_async(true).await {
+                Ok(status_bits) => {
+                    info!("hdc302x: status_bits: {status_bits}");
+                }
+                Err(e) => {
+                    info!("hdc302x: read_status error: {e:?}");
+                    return;
+                }
+            }
+
+            let raw_datum = hdc302x
+                .one_shot_async(LowPowerMode::lowest_noise())
+                .await
+                .unwrap();
+
+            let d = hdc302x::Datum::from(&raw_datum);
+            info!("{:?}", d);
+
+            let centigrade = raw_datum.centigrade().unwrap();
+            let humidity_percent = raw_datum.humidity_percent().unwrap();
+
+            let pdata = ProbeData {
+                centigrade,
+                humidity_percent,
+            };
+
+            let serialized: String<128> = serde_json_core::to_string(&pdata).unwrap();
+
+            temp_sender.send(serialized).await;
+
+            Timer::after(Duration::from_millis(3000)).await;
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn connection(mut controller: WifiController<'static>) {
+    info!("start connection task");
+    info!("Device capabilities: {:?}", controller.capabilities());
+    loop {
+        match esp_wifi::wifi::wifi_state() {
+            WifiState::StaConnected => {
+                // wait until we're no longer connected
+                controller.wait_for_event(WifiEvent::StaDisconnected).await;
+                Timer::after(Duration::from_millis(5000)).await
+            }
+            _ => {}
+        }
+        if !matches!(controller.is_started(), Ok(true)) {
+            let client_config = Configuration::Client(ClientConfiguration {
+                ssid: WIFI_SSID.into(),
+                password: WIFI_PASSWORD.into(),
+                ..Default::default()
+            });
+            controller.set_configuration(&client_config).unwrap();
+            info!("Starting wifi");
+            controller.start_async().await.unwrap();
+            info!("Wifi started!");
+
+            info!("Scan");
+            let result = controller.scan_n_async(10).await.unwrap();
+            for ap in result {
+                info!("{:?}", ap);
+            }
+        }
+        info!("About to connect...");
+
+        match controller.connect_async().await {
+            Ok(_) => info!("Wifi connected!"),
+            Err(e) => {
+                info!("Failed to connect to wifi: {e:?}");
+                Timer::after(Duration::from_millis(5000)).await
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn mqtt_task(
+    stack: Stack<'static>,
+    temp_receiver: Receiver<'static, NoopRawMutex, String<128>, 3>,
+) {
+    loop {
+        let mut rx_buffer = [0; 4096];
+        let mut tx_buffer = [0; 4096];
 
         let server_ipv4 = Ipv4Addr::from_str(MQTT_SERVER_IPV4).unwrap();
 
@@ -228,36 +333,8 @@ async fn main(spawner: Spawner) {
         }
 
         loop {
-            Timer::after(Duration::from_millis(1_000)).await;
-
-            match hdc302x.read_status_async(true).await {
-                Ok(status_bits) => {
-                    info!("hdc302x: status_bits: {status_bits}");
-                }
-                Err(e) => {
-                    info!("hdc302x: read_status error: {e:?}");
-                    return;
-                }
-            }
-
-            let raw_datum = hdc302x
-                .one_shot_async(LowPowerMode::lowest_noise())
-                .await
-                .unwrap();
-
-            let d = hdc302x::Datum::from(&raw_datum);
-            info!("{:?}", d);
-
-            let centigrade = raw_datum.centigrade().unwrap();
-            let humidity_percent = raw_datum.humidity_percent().unwrap();
-
-            let pdata = ProbeData {
-                centigrade,
-                humidity_percent,
-            };
-
-            let serialized: String<128> = serde_json_core::to_string(&pdata).unwrap();
-
+            let serialized = temp_receiver.receive().await;
+            info!("sending MQTT message");
             match mqtt_client
                 .send_message(
                     "temperature/1",
@@ -279,55 +356,6 @@ async fn main(spawner: Spawner) {
                     }
                 },
             }
-
-            Timer::after(Duration::from_millis(3000)).await;
         }
     }
-}
-
-#[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
-    info!("start connection task");
-    info!("Device capabilities: {:?}", controller.capabilities());
-    loop {
-        match esp_wifi::wifi::wifi_state() {
-            WifiState::StaConnected => {
-                // wait until we're no longer connected
-                controller.wait_for_event(WifiEvent::StaDisconnected).await;
-                Timer::after(Duration::from_millis(5000)).await
-            }
-            _ => {}
-        }
-        if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = Configuration::Client(ClientConfiguration {
-                ssid: WIFI_SSID.into(),
-                password: WIFI_PASSWORD.into(),
-                ..Default::default()
-            });
-            controller.set_configuration(&client_config).unwrap();
-            info!("Starting wifi");
-            controller.start_async().await.unwrap();
-            info!("Wifi started!");
-
-            info!("Scan");
-            let result = controller.scan_n_async(10).await.unwrap();
-            for ap in result {
-                info!("{:?}", ap);
-            }
-        }
-        info!("About to connect...");
-
-        match controller.connect_async().await {
-            Ok(_) => info!("Wifi connected!"),
-            Err(e) => {
-                info!("Failed to connect to wifi: {e:?}");
-                Timer::after(Duration::from_millis(5000)).await
-            }
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
-    runner.run().await
 }
