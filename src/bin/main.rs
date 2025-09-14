@@ -10,6 +10,8 @@ use core::net::Ipv4Addr;
 use core::str::FromStr;
 
 use embassy_executor::Spawner;
+use embassy_futures::select::select;
+use embassy_futures::select::Either;
 use embassy_net::Stack;
 use embassy_net::{tcp::TcpSocket, Runner, StackResources};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -332,29 +334,49 @@ async fn mqtt_task(
             },
         }
 
+        match mqtt_client.subscribe_to_topic("updates/1").await {
+            Ok(()) => {}
+            Err(mqtt_error) => match mqtt_error {
+                _ => {
+                    info!("Other MQTT Subscribe Error: {:?}", mqtt_error);
+                    continue;
+                }
+            },
+        }
+
         loop {
-            let serialized = temp_receiver.receive().await;
-            info!("sending MQTT message");
-            match mqtt_client
-                .send_message(
-                    "temperature/1",
-                    serialized.as_bytes(),
-                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
-                    false,
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(mqtt_error) => match mqtt_error {
-                    ReasonCode::NetworkError => {
-                        info!("MQTT Network Error");
-                        continue;
+            match select(temp_receiver.receive(), mqtt_client.receive_message()).await {
+                Either::First(serialized) => {
+                    info!("sending MQTT message");
+                    match mqtt_client
+                        .send_message(
+                            "temperature/1",
+                            serialized.as_bytes(),
+                            rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
+                            false,
+                        )
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(mqtt_error) => match mqtt_error {
+                            ReasonCode::NetworkError => {
+                                info!("MQTT Network Error");
+                                continue;
+                            }
+                            _ => {
+                                info!("Other MQTT Error: {:?}", mqtt_error);
+                                continue;
+                            }
+                        },
                     }
-                    _ => {
-                        info!("Other MQTT Error: {:?}", mqtt_error);
-                        continue;
-                    }
-                },
+                }
+                Either::Second(msg) => {
+                    let (topic, payload) = msg.unwrap();
+                    let mut message = heapless::Vec::<u8, 128>::new();
+                    message.extend_from_slice(payload).unwrap();
+                    let message = heapless::String::from_utf8(message).unwrap();
+                    info!("received message on topic '{topic}' with payload '{message}'")
+                }
             }
         }
     }
