@@ -89,7 +89,7 @@ async fn main(spawner: Spawner) {
         init(timg0.timer0, rng, peripherals.RADIO_CLK).unwrap()
     );
 
-    let (controller, interfaces) = esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
+    let (controller, interfaces) = esp_wifi::wifi::new(esp_wifi_ctrl, peripherals.WIFI).unwrap();
 
     let wifi_interface = interfaces.sta;
 
@@ -187,41 +187,37 @@ async fn main(spawner: Spawner) {
     loop {
         Timer::after(Duration::from_millis(1_000)).await;
 
-        loop {
-            Timer::after(Duration::from_millis(1_000)).await;
-
-            match hdc302x.read_status_async(true).await {
-                Ok(status_bits) => {
-                    info!("hdc302x: status_bits: {status_bits}");
-                }
-                Err(e) => {
-                    info!("hdc302x: read_status error: {e:?}");
-                    return;
-                }
+        match hdc302x.read_status_async(true).await {
+            Ok(status_bits) => {
+                info!("hdc302x: status_bits: {status_bits}");
             }
-
-            let raw_datum = hdc302x
-                .one_shot_async(LowPowerMode::lowest_noise())
-                .await
-                .unwrap();
-
-            let d = hdc302x::Datum::from(&raw_datum);
-            info!("{:?}", d);
-
-            let centigrade = raw_datum.centigrade().unwrap();
-            let humidity_percent = raw_datum.humidity_percent().unwrap();
-
-            let pdata = ProbeData {
-                centigrade,
-                humidity_percent,
-            };
-
-            let serialized: String<128> = serde_json_core::to_string(&pdata).unwrap();
-
-            temp_sender.send(serialized).await;
-
-            Timer::after(Duration::from_millis(3000)).await;
+            Err(e) => {
+                info!("hdc302x: read_status error: {e:?}");
+                return;
+            }
         }
+
+        let raw_datum = hdc302x
+            .one_shot_async(LowPowerMode::lowest_noise())
+            .await
+            .unwrap();
+
+        let d = hdc302x::Datum::from(&raw_datum);
+        info!("{d:?}");
+
+        let centigrade = raw_datum.centigrade().unwrap();
+        let humidity_percent = raw_datum.humidity_percent().unwrap();
+
+        let pdata = ProbeData {
+            centigrade,
+            humidity_percent,
+        };
+
+        let serialized: String<128> = serde_json_core::to_string(&pdata).unwrap();
+
+        temp_sender.send(serialized).await;
+
+        Timer::after(Duration::from_millis(3000)).await;
     }
 }
 
@@ -230,13 +226,10 @@ async fn connection(mut controller: WifiController<'static>) {
     info!("start connection task");
     info!("Device capabilities: {:?}", controller.capabilities());
     loop {
-        match esp_wifi::wifi::wifi_state() {
-            WifiState::StaConnected => {
-                // wait until we're no longer connected
-                controller.wait_for_event(WifiEvent::StaDisconnected).await;
-                Timer::after(Duration::from_millis(5000)).await
-            }
-            _ => {}
+        if esp_wifi::wifi::wifi_state() == WifiState::StaConnected {
+            // wait until we're no longer connected
+            controller.wait_for_event(WifiEvent::StaDisconnected).await;
+            Timer::after(Duration::from_millis(5000)).await
         }
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config = Configuration::Client(ClientConfiguration {
@@ -252,7 +245,7 @@ async fn connection(mut controller: WifiController<'static>) {
             info!("Scan");
             let result = controller.scan_n_async(10).await.unwrap();
             for ap in result {
-                info!("{:?}", ap);
+                info!("{ap:?}");
             }
         }
         info!("About to connect...");
@@ -288,10 +281,10 @@ async fn mqtt_task(
         socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
 
         let remote_endpoint = (server_ipv4, 1883);
-        info!("connecting to {}...", server_ipv4);
+        info!("connecting to {server_ipv4}...");
         let r = socket.connect(remote_endpoint).await;
         if let Err(e) = r {
-            info!("connect error: {:?}", e);
+            info!("connect error: {e:?}");
             continue;
         }
         info!("connected!");
@@ -328,7 +321,7 @@ async fn mqtt_task(
                     continue;
                 }
                 _ => {
-                    info!("Other MQTT Error: {:?}", mqtt_error);
+                    info!("Other MQTT Error: {mqtt_error:?}");
                     continue;
                 }
             },
@@ -336,12 +329,10 @@ async fn mqtt_task(
 
         match mqtt_client.subscribe_to_topic("updates/1").await {
             Ok(()) => {}
-            Err(mqtt_error) => match mqtt_error {
-                _ => {
-                    info!("Other MQTT Subscribe Error: {:?}", mqtt_error);
-                    continue;
-                }
-            },
+            Err(mqtt_error) => {
+                info!("Other MQTT Subscribe Error: {mqtt_error:?}");
+                continue;
+            }
         }
 
         loop {
@@ -364,7 +355,7 @@ async fn mqtt_task(
                                 continue;
                             }
                             _ => {
-                                info!("Other MQTT Error: {:?}", mqtt_error);
+                                info!("Other MQTT Error: {mqtt_error:?}");
                                 continue;
                             }
                         },
