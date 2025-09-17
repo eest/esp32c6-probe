@@ -13,11 +13,18 @@ use embassy_executor::Spawner;
 use embassy_futures::select::select;
 use embassy_futures::select::Either;
 use embassy_net::Stack;
-use embassy_net::{tcp::TcpSocket, Runner, StackResources};
+use embassy_net::{
+    dns::DnsSocket,
+    tcp::client::{TcpClient, TcpClientState},
+    tcp::TcpSocket,
+    Runner, StackResources,
+};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::channel::Receiver;
+use embassy_sync::channel::Sender;
 use embassy_time::{Duration, Timer};
+use embedded_io_async::Read;
 use esp_backtrace as _;
 use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
@@ -31,6 +38,7 @@ use esp_wifi::{
 };
 use heapless::String;
 use log::info;
+use reqwless::client::HttpClient;
 use rust_mqtt::{
     client::{client::MqttClient, client_config::ClientConfig},
     packet::v5::reason_codes::ReasonCode,
@@ -69,7 +77,8 @@ macro_rules! mk_static {
     }};
 }
 
-static CHANNEL: StaticCell<Channel<NoopRawMutex, String<128>, 3>> = StaticCell::new();
+static MQTT_CHANNEL: StaticCell<Channel<NoopRawMutex, String<128>, 3>> = StaticCell::new();
+static OTA_CHANNEL: StaticCell<Channel<NoopRawMutex, String<128>, 3>> = StaticCell::new();
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
@@ -154,7 +163,7 @@ async fn main(spawner: Spawner) {
     let (stack, runner) = embassy_net::new(
         wifi_interface,
         config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<4>, StackResources::<4>::new()),
         seed,
     );
 
@@ -177,10 +186,19 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(500)).await;
     }
 
-    //let temp_channel = mk_static!(Channel::<NoopRawMutex, String<128>, 3>::new();
-    let temp_channel = CHANNEL.init(Channel::new());
+    let ota_update_channel = OTA_CHANNEL.init(Channel::new());
+    let temp_channel = MQTT_CHANNEL.init(Channel::new());
+
     spawner
-        .spawn(mqtt_task(stack, temp_channel.receiver()))
+        .spawn(ota_update_task(stack, ota_update_channel.receiver()))
+        .ok();
+
+    spawner
+        .spawn(mqtt_task(
+            stack,
+            temp_channel.receiver(),
+            ota_update_channel.sender(),
+        ))
         .ok();
     let temp_sender = temp_channel.sender();
 
@@ -269,6 +287,7 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
 async fn mqtt_task(
     stack: Stack<'static>,
     temp_receiver: Receiver<'static, NoopRawMutex, String<128>, 3>,
+    ota_update_sender: Sender<'static, NoopRawMutex, String<128>, 3>,
 ) {
     loop {
         let mut rx_buffer = [0; 4096];
@@ -366,7 +385,66 @@ async fn mqtt_task(
                     let mut message = heapless::Vec::<u8, 128>::new();
                     message.extend_from_slice(payload).unwrap();
                     let message = heapless::String::from_utf8(message).unwrap();
-                    info!("received message on topic '{topic}' with payload '{message}'")
+                    info!("received message on topic '{topic}' with payload '{message}'");
+                    ota_update_sender.send(message).await;
+                }
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn ota_update_task(
+    stack: Stack<'static>,
+    ota_update_receiver: Receiver<'static, NoopRawMutex, String<128>, 3>,
+) {
+    let mut header_buf = [0; 4096];
+    let mut body_buf = [0; 4096];
+
+    let state = TcpClientState::<1, 4096, 4096>::new();
+    let tcp_client = TcpClient::new(stack, &state);
+    let dns_socket = DnsSocket::new(stack);
+
+    let mut client = HttpClient::new(&tcp_client, &dns_socket);
+
+    loop {
+        let update = ota_update_receiver.receive().await;
+        info!("OTA update task received: '{update}'");
+        let mut http_req = client
+            .request(
+                reqwless::request::Method::GET,
+                "http://192.168.10.1/firmware",
+            )
+            .await
+            .unwrap();
+
+        let http_resp = http_req.send(&mut header_buf).await.unwrap();
+
+        info!("HTTP resp status: {:?}", http_resp.status);
+
+        if !http_resp.status.is_successful() {
+            info!("HTTP request no successfull, bailing out");
+            continue;
+        }
+
+        let mut total_bytes = 0;
+        if let Some(content_length) = http_resp.content_length {
+            info!("content length: {content_length}");
+            let mut br = http_resp.body().reader();
+            loop {
+                match br.read(&mut body_buf).await {
+                    Ok(num_bytes) => {
+                        info!("read {num_bytes}");
+                        total_bytes += num_bytes;
+                        if total_bytes == content_length {
+                            info!("all {content_length} bytes read");
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        info!("error reading body: {err:?}");
+                        break;
+                    }
                 }
             }
         }
