@@ -25,12 +25,14 @@ use embassy_sync::channel::Receiver;
 use embassy_sync::channel::Sender;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Read;
+use embedded_storage::Storage;
 use esp_backtrace as _;
 use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::timer::OneShotTimer;
 use esp_hal::{clock::CpuClock, i2c::master, rng::Rng, time::Rate};
 use esp_println::logger::init_logger_from_env;
+use esp_storage::FlashStorage;
 use esp_wifi::{
     init,
     wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
@@ -46,6 +48,13 @@ use rust_mqtt::{
 };
 use serde::Serialize;
 use static_cell::StaticCell;
+
+use esp_bootloader_esp_idf::{
+    ota::Slot,
+    partitions::{
+        self, AppPartitionSubType, DataPartitionSubType, Error, PartitionEntry, PartitionTable,
+    },
+};
 
 extern crate alloc;
 
@@ -93,10 +102,7 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let mut rng = Rng::new(peripherals.RNG);
 
-    let esp_wifi_ctrl = &*mk_static!(
-        EspWifiController<'static>,
-        init(timg0.timer0, rng, peripherals.RADIO_CLK).unwrap()
-    );
+    let esp_wifi_ctrl = &*mk_static!(EspWifiController<'static>, init(timg0.timer0, rng).unwrap());
 
     let (controller, interfaces) = esp_wifi::wifi::new(esp_wifi_ctrl, peripherals.WIFI).unwrap();
 
@@ -408,8 +414,84 @@ async fn ota_update_task(
     let mut client = HttpClient::new(&tcp_client, &dns_socket);
 
     loop {
+        let mut flash = FlashStorage::new();
+
+        let mut buffer = [0u8; esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN];
+
+        let pt = esp_bootloader_esp_idf::partitions::read_partition_table(&mut flash, &mut buffer)
+            .unwrap();
+
+        // List all partitions - this is just FYI
+        for i in 0..pt.len() {
+            info!("{:?}", pt.get_partition(i));
+        }
+
+        // Use this once the esp-bootloader-esp-idf crate with this method is released.
+        // info!("Currently booted partition {:?}", pt.booted_partition());
+        info!("Currently booted partition {:?}", booted_partition(&pt));
+
+        // Find the OTA-data partition and show the currently active partition
+        let ota_part = pt
+            .find_partition(esp_bootloader_esp_idf::partitions::PartitionType::Data(
+                DataPartitionSubType::Ota,
+            ))
+            .unwrap()
+            .unwrap();
+
+        let mut ota_part = ota_part.as_embedded_storage(&mut flash);
+        info!("Found ota data");
+
+        let mut ota = esp_bootloader_esp_idf::ota::Ota::new(&mut ota_part).unwrap();
+        let current = ota.current_slot().unwrap();
+        info!(
+        "current image state {:?} (only relevant if the bootloader was built with auto-rollback support)",
+        ota.current_ota_state()
+    );
+        info!("current {:?} - next {:?}", current, current.next());
+
+        // Mark the current slot as VALID - this is only needed if the bootloader was
+        // built with auto-rollback support. The default pre-compiled bootloader in
+        // espflash is NOT.
+        if ota.current_slot().unwrap() != Slot::None
+            && (ota.current_ota_state().unwrap() == esp_bootloader_esp_idf::ota::OtaImageState::New
+                || ota.current_ota_state().unwrap()
+                    == esp_bootloader_esp_idf::ota::OtaImageState::PendingVerify)
+        {
+            info!("Changed state to VALID");
+            ota.set_current_ota_state(esp_bootloader_esp_idf::ota::OtaImageState::Valid)
+                .unwrap();
+        }
+
+        let next_slot = current.next();
+
+        info!("On update notification image will be flashed to {next_slot:?}");
+        //
+        // find the target app partition
+        let next_app_partition = match next_slot {
+            Slot::None => {
+                // None is FACTORY if present, OTA0 otherwise
+                pt.find_partition(partitions::PartitionType::App(AppPartitionSubType::Factory))
+                    .or_else(|_| {
+                        pt.find_partition(partitions::PartitionType::App(AppPartitionSubType::Ota0))
+                    })
+                    .unwrap()
+            }
+            Slot::Slot0 => pt
+                .find_partition(partitions::PartitionType::App(AppPartitionSubType::Ota0))
+                .unwrap(),
+            Slot::Slot1 => pt
+                .find_partition(partitions::PartitionType::App(AppPartitionSubType::Ota1))
+                .unwrap(),
+        }
+        .unwrap();
+
+        info!("Found partition: {next_app_partition:?}");
+        let mut next_app_partition = next_app_partition.as_embedded_storage(&mut flash);
+
+        // Wait here for MQTT trigger to update
         let update = ota_update_receiver.receive().await;
         info!("OTA update task received: '{update}'");
+
         let mut http_req = client
             .request(
                 reqwless::request::Method::GET,
@@ -427,17 +509,22 @@ async fn ota_update_task(
             continue;
         }
 
-        let mut total_bytes = 0;
+        let mut written_bytes = 0;
         if let Some(content_length) = http_resp.content_length {
             info!("content length: {content_length}");
             let mut br = http_resp.body().reader();
             loop {
                 match br.read(&mut body_buf).await {
                     Ok(num_bytes) => {
+                        // write to the app partition
                         info!("read {num_bytes}");
-                        total_bytes += num_bytes;
-                        if total_bytes == content_length {
-                            info!("all {content_length} bytes read");
+                        info!("Writing {num_bytes} at offset {written_bytes}...");
+                        next_app_partition
+                            .write(written_bytes as u32, &body_buf[..num_bytes])
+                            .unwrap();
+                        written_bytes += num_bytes;
+                        if written_bytes == content_length {
+                            info!("all {content_length} bytes written");
                             break;
                         }
                     }
@@ -447,6 +534,46 @@ async fn ota_update_task(
                     }
                 }
             }
+
+            info!("Changing OTA slot and setting the state to NEW");
+            let ota_part = pt
+                .find_partition(esp_bootloader_esp_idf::partitions::PartitionType::Data(
+                    DataPartitionSubType::Ota,
+                ))
+                .unwrap()
+                .unwrap();
+            let mut ota_part = ota_part.as_embedded_storage(&mut flash);
+            let mut ota = esp_bootloader_esp_idf::ota::Ota::new(&mut ota_part).unwrap();
+            ota.set_current_slot(next_slot).unwrap();
+            ota.set_current_ota_state(esp_bootloader_esp_idf::ota::OtaImageState::New)
+                .unwrap();
+
+            info!("resetting chip!");
+
+            esp_hal::system::software_reset()
         }
     }
+}
+
+// Work around missing method in released esp-bootloader-esp-idf:
+// ===
+// no method named `booted_partition` found for struct `esp_bootloader_esp_idf::partitions::PartitionTable` in the current scope
+// ===
+// this function is a copy of the esp32c6 code for that function, can probably be removed once a
+// version later than v0.2.0 is available
+fn booted_partition<'a>(pt: &PartitionTable<'a>) -> Result<Option<PartitionEntry<'a>>, Error> {
+    // Read entry 0 from MMU to know which partition is mapped
+    let paddr = unsafe {
+        ((0x60002000 + 0x380) as *mut u32).write_volatile(0);
+        (((0x60002000 + 0x37c) as *const u32).read_volatile() & 0xff) << 16
+    };
+
+    for id in 0..pt.len() {
+        let entry = pt.get_partition(id)?;
+        if entry.offset() == paddr {
+            return Ok(Some(entry));
+        }
+    }
+
+    Ok(None)
 }
