@@ -20,3 +20,8 @@ $ espflash save-image --chip=esp32c6 target/riscv32imac-unknown-none-elf/release
 ```
 
 The resulting file named "firmware" can now be put on a webserver for downloading by the probe.
+
+You trigger the firmware update by sending a MQTT message, something like:
+```
+mosquitto_pub -h 10.0.0.2 -u username -P password -t updates/1 -m "test message"
+```
