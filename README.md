@@ -12,3 +12,11 @@ To flash the device after plugging it in via USB-C:
 ```
 WIFI_SSID=wifi_ssid WIFI_PASSWORD=wifi_password MQTT_SERVER_IPV4=192.0.2.0 MQTT_USERNAME=mqtt_username MQTT_PASSWORD=mqtt_password cargo run
 ```
+
+To build a firmware image for OTA (Over The Air Updates), do this:
+```
+$ WIFI_SSID=wifi_ssid WIFI_PASSWORD=wifi_password MQTT_SERVER_IPV4=192.0.2.0 MQTT_USERNAME=mqtt_username MQTT_PASSWORD=mqtt_password cargo build --release
+$ espflash save-image --chip=esp32c6 target/riscv32imac-unknown-none-elf/release/esp32c6-probe firmware
+```
+
+The resulting file named "firmware" can now be put on a webserver for downloading by the probe.
