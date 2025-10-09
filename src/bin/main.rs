@@ -9,6 +9,7 @@
 use core::net::Ipv4Addr;
 use core::str::FromStr;
 
+use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
 use embassy_futures::select::Either;
@@ -23,6 +24,7 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::channel::Receiver;
 use embassy_sync::channel::Sender;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Read;
 use embedded_storage::Storage;
@@ -30,6 +32,7 @@ use esp_backtrace as _;
 use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::timer::OneShotTimer;
+use esp_hal::Async;
 use esp_hal::{clock::CpuClock, i2c::master, rng::Rng, time::Rate};
 use esp_println::logger::init_logger_from_env;
 use esp_storage::FlashStorage;
@@ -38,6 +41,7 @@ use esp_wifi::{
     wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
     EspWifiController,
 };
+use hd44780_driver::DisplayMode;
 use heapless::String;
 use log::info;
 use reqwless::client::HttpClient;
@@ -59,6 +63,16 @@ use esp_bootloader_esp_idf::{
 extern crate alloc;
 
 use hdc302x::{Hdc302x, I2cAddr, LowPowerMode, ManufacturerId};
+
+use hd44780_driver::memory_map::MemoryMap1602;
+use hd44780_driver::non_blocking::HD44780;
+use hd44780_driver::setup::DisplayOptionsI2C;
+use hd44780_driver::{Cursor, CursorBlink, Display};
+
+// https://docs.embassy.dev/embassy-embedded-hal/git/default/shared_bus/asynch/i2c/index.html
+// https://github.com/rust-embedded-community/ssd1306/issues/215#issuecomment-2649496233
+static I2C_BUS: StaticCell<Mutex<NoopRawMutex, esp_hal::i2c::master::I2c<Async>>> =
+    StaticCell::new();
 
 #[derive(Serialize)]
 struct ProbeData {
@@ -120,9 +134,54 @@ async fn main(spawner: Spawner) {
     .with_scl(peripherals.GPIO7)
     .into_async();
 
+    let i2c_bus = Mutex::new(i2c);
+    let i2c_bus = I2C_BUS.init(i2c_bus);
+
+    let i2c_dev1 = I2cDevice::new(i2c_bus);
+
+    let lcd_i2c_address = 0x27;
+    let Ok(mut lcd) = HD44780::new(
+        DisplayOptionsI2C::new(MemoryMap1602::new()).with_i2c_bus(i2c_dev1, lcd_i2c_address),
+        &mut embassy_time::Delay,
+    )
+    .await
+    else {
+        panic!("failed to initialize display");
+    };
+
+    lcd.set_display_mode(
+        DisplayMode {
+            cursor_visibility: Cursor::Invisible,
+            cursor_blink: CursorBlink::Off,
+            display: Display::On,
+        },
+        &mut embassy_time::Delay,
+    )
+    .await
+    .unwrap();
+
+    lcd.reset(&mut embassy_time::Delay).await.unwrap();
+
+    lcd.clear(&mut embassy_time::Delay).await.unwrap();
+
+    lcd.write_str("esp32c6-probe", &mut embassy_time::Delay)
+        .await
+        .unwrap();
+
+    // Move the cursor to the second line
+    lcd.set_cursor_xy((0, 1), &mut embassy_time::Delay)
+        .await
+        .unwrap();
+
+    lcd.write_str("starting up...", &mut embassy_time::Delay)
+        .await
+        .unwrap();
+
     let delay = OneShotTimer::new(systimer.alarm1).into_async();
 
-    let mut hdc302x = Hdc302x::new(i2c, delay, I2cAddr::Addr00);
+    let i2c_dev2 = I2cDevice::new(i2c_bus);
+
+    let mut hdc302x = Hdc302x::new(i2c_dev2, delay, I2cAddr::Addr00);
 
     match hdc302x.read_manufacturer_id_async().await {
         Ok(ManufacturerId::TexasInstruments) => {
@@ -231,6 +290,19 @@ async fn main(spawner: Spawner) {
 
         let centigrade = raw_datum.centigrade().unwrap();
         let humidity_percent = raw_datum.humidity_percent().unwrap();
+
+        let mut buffer = ryu::Buffer::new();
+        let printed = buffer.format(centigrade);
+
+        lcd.reset(&mut embassy_time::Delay).await.unwrap();
+        lcd.clear(&mut embassy_time::Delay).await.unwrap();
+        lcd.write_str("temp: ", &mut embassy_time::Delay)
+            .await
+            .unwrap();
+        lcd.write_str(printed, &mut embassy_time::Delay)
+            .await
+            .unwrap();
+        lcd.write_str("C", &mut embassy_time::Delay).await.unwrap();
 
         let pdata = ProbeData {
             centigrade,
