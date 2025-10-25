@@ -29,6 +29,8 @@ use embassy_time::{Duration, Timer};
 use embedded_io_async::Read;
 use embedded_storage::Storage;
 use esp_backtrace as _;
+use esp_hal::gpio::{Input, InputConfig};
+use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::timer::OneShotTimer;
@@ -160,6 +162,34 @@ async fn main(spawner: Spawner) {
     .await
     .unwrap();
 
+    let mut input_pin = Input::new(peripherals.GPIO23, InputConfig::default());
+    let mut output_pin = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
+
+    lcd.reset(&mut embassy_time::Delay).await.unwrap();
+
+    lcd.clear(&mut embassy_time::Delay).await.unwrap();
+
+    lcd.write_str("blinking...", &mut embassy_time::Delay)
+        .await
+        .unwrap();
+
+    for _ in 0..5 {
+        output_pin.set_high();
+        Timer::after(Duration::from_millis(500)).await;
+        output_pin.set_low();
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
+    lcd.reset(&mut embassy_time::Delay).await.unwrap();
+
+    lcd.clear(&mut embassy_time::Delay).await.unwrap();
+
+    lcd.write_str("press me...", &mut embassy_time::Delay)
+        .await
+        .unwrap();
+
+    input_pin.wait_for_high().await;
+
     lcd.reset(&mut embassy_time::Delay).await.unwrap();
 
     lcd.clear(&mut embassy_time::Delay).await.unwrap();
@@ -288,21 +318,41 @@ async fn main(spawner: Spawner) {
         let d = hdc302x::Datum::from(&raw_datum);
         info!("{d:?}");
 
-        let centigrade = raw_datum.centigrade().unwrap();
-        let humidity_percent = raw_datum.humidity_percent().unwrap();
+        // The sensor temperature precision is 0.1C, keep it as f32 since this is what raw_datum
+        // returns
+        let centigrade: f32 =
+            (libm::round(raw_datum.centigrade().unwrap() as f64 * 10.0) / 10.0) as f32;
+        // The sensor humidity precision is 0.5%RH
+        let humidity_percent: f32 =
+            (libm::round(raw_datum.humidity_percent().unwrap() as f64 * 2.0) / 2.0) as f32;
 
-        let mut buffer = ryu::Buffer::new();
-        let printed = buffer.format(centigrade);
+        let mut ryu_buffer = ryu::Buffer::new();
 
         lcd.reset(&mut embassy_time::Delay).await.unwrap();
         lcd.clear(&mut embassy_time::Delay).await.unwrap();
         lcd.write_str("temp: ", &mut embassy_time::Delay)
             .await
             .unwrap();
-        lcd.write_str(printed, &mut embassy_time::Delay)
+        lcd.write_str(ryu_buffer.format(centigrade), &mut embassy_time::Delay)
             .await
             .unwrap();
         lcd.write_str("C", &mut embassy_time::Delay).await.unwrap();
+
+        // Move the cursor to the second line
+        lcd.set_cursor_xy((0, 1), &mut embassy_time::Delay)
+            .await
+            .unwrap();
+
+        lcd.write_str("humidity: ", &mut embassy_time::Delay)
+            .await
+            .unwrap();
+        lcd.write_str(
+            ryu_buffer.format(humidity_percent),
+            &mut embassy_time::Delay,
+        )
+        .await
+        .unwrap();
+        lcd.write_str("%", &mut embassy_time::Delay).await.unwrap();
 
         let pdata = ProbeData {
             centigrade,
